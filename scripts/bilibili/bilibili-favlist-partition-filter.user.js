@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         [Bilibili] 收藏页分区筛选恢复
 // @namespace    https://github.com/yinyongqi/usefulbilibili
-// @version      0.1.0
-// @description  在收藏夹页面恢复“按分区筛选”能力，选择分区后按接口结果重绘当前收藏夹列表
+// @version      0.2.0
+// @description  在收藏夹页面恢复“按分区筛选”能力，并支持筛选结果内批量取消收藏
 // @match        https://space.bilibili.com/*/favlist*
 // @run-at       document-idle
 // @grant        none
@@ -15,9 +15,11 @@
   const PANEL_ID = `${SCRIPT_KEY}-panel`;
   const ROOT_ID = `${SCRIPT_KEY}-root`;
   const STYLE_ID = `${SCRIPT_KEY}-style`;
+  const TOAST_ID = `${SCRIPT_KEY}-toast`;
   const HOST_SELECTOR = '.favlist-main .fav-list-main';
   const MAIN_SELECTOR = '.favlist-main';
   const SIDEBAR_SELECTOR = '.favlist-aside .vui_sidebar';
+  const BATCH_BTN_SELECTOR = '.favlist-main .favlist-info-batch';
   const PAGE_SIZE = 36;
   const CHANNELS = [
     { tid: 0, name: '全部分区' },
@@ -50,6 +52,10 @@
     host: null,
     panel: null,
     root: null,
+    lastData: null,
+    batchMode: false,
+    deleting: false,
+    selectedResources: new Set(),
     requestToken: 0,
     syncToken: 0,
   };
@@ -156,7 +162,9 @@
       }
       #${ROOT_ID} .tm-fav-filter-actions{
         display:flex;
+        flex-wrap:wrap;
         align-items:center;
+        justify-content:flex-end;
         gap:8px;
       }
       #${ROOT_ID} .tm-fav-filter-page-btn{
@@ -167,6 +175,22 @@
         background:#fff;
         color:#18191c;
         cursor:pointer;
+      }
+      #${ROOT_ID} .tm-fav-filter-page-btn.tm-fav-filter-accent-btn{
+        border-color:transparent;
+        background:#00aeec;
+        color:#fff;
+      }
+      #${ROOT_ID} .tm-fav-filter-page-btn.tm-fav-filter-accent-btn:hover{
+        background:#0cb8f2;
+      }
+      #${ROOT_ID} .tm-fav-filter-page-btn.tm-fav-filter-danger-btn{
+        border-color:transparent;
+        background:#fb7299;
+        color:#fff;
+      }
+      #${ROOT_ID} .tm-fav-filter-page-btn.tm-fav-filter-danger-btn:hover{
+        background:#fc86a8;
       }
       #${ROOT_ID} .tm-fav-filter-page-btn[disabled]{
         opacity:.42;
@@ -196,12 +220,41 @@
         background:#fff;
         box-shadow: 0 12px 28px rgba(11, 32, 78, .06);
       }
+      #${ROOT_ID} .tm-fav-filter-card.tm-fav-filter-card--batch{
+        cursor:pointer;
+      }
+      #${ROOT_ID} .tm-fav-filter-card.tm-fav-filter-card--selected{
+        box-shadow: 0 0 0 2px rgba(0, 174, 236, .78), 0 12px 28px rgba(11, 32, 78, .10);
+      }
       #${ROOT_ID} .tm-fav-filter-cover{
         position:relative;
         display:block;
         aspect-ratio:16 / 10;
         overflow:hidden;
         background:linear-gradient(135deg, #eef4ff, #f8fbff);
+      }
+      #${ROOT_ID} .tm-fav-filter-check{
+        position:absolute;
+        top:10px;
+        left:10px;
+        z-index:3;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        width:30px;
+        height:30px;
+        border:none;
+        border-radius:999px;
+        background:rgba(255,255,255,.94);
+        color:#61666d;
+        font-size:15px;
+        font-weight:700;
+        cursor:pointer;
+        box-shadow:0 8px 18px rgba(11, 32, 78, .16);
+      }
+      #${ROOT_ID} .tm-fav-filter-check.tm-fav-filter-check--selected{
+        background:#00aeec;
+        color:#fff;
       }
       #${ROOT_ID} .tm-fav-filter-cover img{
         width:100%;
@@ -264,6 +317,24 @@
           padding:12px;
         }
       }
+      #${TOAST_ID}{
+        position:fixed;
+        top:18px;
+        left:50%;
+        z-index:999999;
+        transform:translateX(-50%);
+        max-width:min(72vw, 520px);
+        padding:10px 14px;
+        border-radius:12px;
+        background:rgba(24, 25, 28, .88);
+        color:#fff;
+        font-size:13px;
+        line-height:1.45;
+        box-shadow:0 14px 34px rgba(0, 0, 0, .18);
+        opacity:0;
+        pointer-events:none;
+        transition:opacity .18s ease;
+      }
     `;
 
     document.head.appendChild(style);
@@ -276,6 +347,26 @@
 
   function getQuery(name) {
     return new URL(location.href).searchParams.get(name) || '';
+  }
+
+  function getCookie(name) {
+    const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}=([^;]*)`));
+    return match ? decodeURIComponent(match[1]) : '';
+  }
+
+  function toast(text) {
+    let el = document.getElementById(TOAST_ID);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = TOAST_ID;
+      document.body.appendChild(el);
+    }
+    el.textContent = text;
+    el.style.opacity = '1';
+    clearTimeout(el.__timer);
+    el.__timer = setTimeout(() => {
+      el.style.opacity = '0';
+    }, 1800);
   }
 
   function buildMediaId(mid, fid) {
@@ -332,6 +423,30 @@
       const json = await res.json();
       if (json.code !== 0) throw new Error(json.message || `接口错误(${json.code})`);
       return json.data;
+    });
+  }
+
+  function postFormJSON(url, params) {
+    const body = new URLSearchParams(params).toString();
+    return fetchJSON(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+      },
+      body,
+    });
+  }
+
+  async function batchDeleteResources(resourceList) {
+    const csrf = getCookie('bili_jct');
+    if (!csrf) throw new Error('未获取到 bili_jct，请确认已登录 B 站');
+    if (!state.mediaId) throw new Error('未识别当前收藏夹 media_id');
+
+    return postFormJSON('https://api.bilibili.com/x/v3/fav/resource/batch-del', {
+      media_id: String(state.mediaId),
+      resources: resourceList,
+      platform: 'web',
+      csrf,
     });
   }
 
@@ -437,12 +552,16 @@
       select.addEventListener('change', () => {
         state.tid = Number(select.value) || 0;
         state.pn = 1;
+        state.lastData = null;
+        resetSelectionState(true);
         syncMode();
         if (state.tid !== 0) renderFilteredList();
       });
       panel.querySelector('.tm-fav-filter-reset').addEventListener('click', () => {
         state.tid = 0;
         state.pn = 1;
+        state.lastData = null;
+        resetSelectionState(true);
         select.value = '0';
         syncMode();
       });
@@ -475,6 +594,11 @@
 
     const resetBtn = state.panel?.querySelector('.tm-fav-filter-reset');
     if (resetBtn) resetBtn.style.display = customActive ? '' : 'none';
+
+    const nativeBatchBtn = document.querySelector(BATCH_BTN_SELECTOR);
+    if (nativeBatchBtn) {
+      nativeBatchBtn.style.display = customActive ? 'none' : '';
+    }
   }
 
   function showState(text) {
@@ -493,9 +617,80 @@
     return 'https://www.bilibili.com/';
   }
 
+  function buildResourceKey(media) {
+    return `${media.id}:${media.type}`;
+  }
+
+  function resetSelectionState(exitBatchMode = false) {
+    state.selectedResources.clear();
+    if (exitBatchMode) {
+      state.batchMode = false;
+    }
+  }
+
+  function rerenderCurrentView() {
+    if (state.lastData) {
+      renderList(state.lastData);
+    }
+  }
+
+  function toggleResourceSelected(resourceKey) {
+    if (state.deleting) return;
+    if (!resourceKey) return;
+    if (state.selectedResources.has(resourceKey)) {
+      state.selectedResources.delete(resourceKey);
+    } else {
+      state.selectedResources.add(resourceKey);
+    }
+    rerenderCurrentView();
+  }
+
+  function selectAllCurrentPage() {
+    const medias = Array.isArray(state.lastData?.medias) ? state.lastData.medias : [];
+    medias.forEach((media) => state.selectedResources.add(buildResourceKey(media)));
+    rerenderCurrentView();
+  }
+
+  function clearSelection() {
+    state.selectedResources.clear();
+    rerenderCurrentView();
+  }
+
+  async function handleBatchDelete() {
+    const resources = Array.from(state.selectedResources);
+    if (state.deleting || resources.length === 0) return;
+
+    const ok = confirm(`确认取消收藏已选中的 ${resources.length} 个视频吗？`);
+    if (!ok) return;
+
+    state.deleting = true;
+    rerenderCurrentView();
+
+    try {
+      await batchDeleteResources(resources.join(','));
+      resources.forEach((item) => state.selectedResources.delete(item));
+      toast(`已取消收藏 ${resources.length} 个视频`);
+      state.deleting = false;
+      await renderFilteredList();
+    } catch (err) {
+      state.deleting = false;
+      rerenderCurrentView();
+      toast(`批量取消收藏失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   function createCard(media) {
     const li = document.createElement('li');
     li.className = 'tm-fav-filter-card';
+
+    const resourceKey = buildResourceKey(media);
+    const isSelected = state.selectedResources.has(resourceKey);
+    if (state.batchMode) {
+      li.classList.add('tm-fav-filter-card--batch');
+    }
+    if (isSelected) {
+      li.classList.add('tm-fav-filter-card--selected');
+    }
 
     const coverLink = document.createElement('a');
     coverLink.className = 'tm-fav-filter-cover';
@@ -550,6 +745,25 @@
     body.appendChild(upLine);
     body.appendChild(statLine);
 
+    if (state.batchMode) {
+      const check = document.createElement('button');
+      check.type = 'button';
+      check.className = `tm-fav-filter-check${isSelected ? ' tm-fav-filter-check--selected' : ''}`;
+      check.textContent = isSelected ? '✓' : '○';
+      check.title = isSelected ? '取消选中' : '选中用于批量取消收藏';
+      check.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        toggleResourceSelected(resourceKey);
+      });
+      li.appendChild(check);
+
+      li.addEventListener('click', (event) => {
+        if (event.target.closest('a, button')) return;
+        toggleResourceSelected(resourceKey);
+      });
+    }
+
     li.appendChild(coverLink);
     li.appendChild(body);
     return li;
@@ -576,12 +790,63 @@
     const actions = document.createElement('div');
     actions.className = 'tm-fav-filter-actions';
 
+    if (state.batchMode) {
+      const selectAll = document.createElement('button');
+      selectAll.type = 'button';
+      selectAll.className = 'tm-fav-filter-page-btn';
+      selectAll.textContent = '全选本页';
+      selectAll.disabled = state.deleting;
+      selectAll.addEventListener('click', selectAllCurrentPage);
+
+      const clearBtn = document.createElement('button');
+      clearBtn.type = 'button';
+      clearBtn.className = 'tm-fav-filter-page-btn';
+      clearBtn.textContent = '清空已选';
+      clearBtn.disabled = state.deleting || state.selectedResources.size === 0;
+      clearBtn.addEventListener('click', clearSelection);
+
+      const deleteBtn = document.createElement('button');
+      deleteBtn.type = 'button';
+      deleteBtn.className = 'tm-fav-filter-page-btn tm-fav-filter-danger-btn';
+      deleteBtn.textContent = state.deleting
+        ? '取消收藏中...'
+        : `取消收藏（${state.selectedResources.size}）`;
+      deleteBtn.disabled = state.deleting || state.selectedResources.size === 0;
+      deleteBtn.addEventListener('click', handleBatchDelete);
+
+      const doneBtn = document.createElement('button');
+      doneBtn.type = 'button';
+      doneBtn.className = 'tm-fav-filter-page-btn';
+      doneBtn.textContent = '完成';
+      doneBtn.disabled = state.deleting;
+      doneBtn.addEventListener('click', () => {
+        resetSelectionState(true);
+        rerenderCurrentView();
+      });
+
+      actions.appendChild(selectAll);
+      actions.appendChild(clearBtn);
+      actions.appendChild(deleteBtn);
+      actions.appendChild(doneBtn);
+    } else {
+      const batchBtn = document.createElement('button');
+      batchBtn.type = 'button';
+      batchBtn.className = 'tm-fav-filter-page-btn tm-fav-filter-accent-btn';
+      batchBtn.textContent = '批量取消收藏';
+      batchBtn.addEventListener('click', () => {
+        state.batchMode = true;
+        state.selectedResources.clear();
+        rerenderCurrentView();
+      });
+      actions.appendChild(batchBtn);
+    }
+
     const prev = document.createElement('button');
     prev.type = 'button';
     prev.className = 'tm-fav-filter-page-btn';
     prev.dataset.role = 'prev';
     prev.textContent = '上一页';
-    prev.disabled = state.pn <= 1;
+    prev.disabled = state.pn <= 1 || state.deleting;
 
     const pageInfo = document.createElement('span');
     pageInfo.className = 'tm-fav-filter-page-info';
@@ -592,7 +857,7 @@
     next.className = 'tm-fav-filter-page-btn';
     next.dataset.role = 'next';
     next.textContent = '下一页';
-    next.disabled = !state.hasMore;
+    next.disabled = !state.hasMore || state.deleting;
 
     actions.appendChild(prev);
     actions.appendChild(pageInfo);
@@ -670,10 +935,16 @@
       const data = await fetchJSON(`https://api.bilibili.com/x/v3/fav/resource/list?${params.toString()}`);
       if (token !== state.requestToken) return;
 
+      if (Array.isArray(data?.medias) && data.medias.length === 0 && state.pn > 1) {
+        state.pn -= 1;
+        return renderFilteredList();
+      }
+
       if (data?.info?.title && !state.folderTitle) {
         state.folderTitle = data.info.title;
       }
 
+      state.lastData = data;
       renderList(data);
     } catch (err) {
       if (token !== state.requestToken) return;
@@ -697,6 +968,8 @@
 
     if (folderChanged) {
       state.pn = 1;
+      state.lastData = null;
+      resetSelectionState(true);
     }
 
     if (state.tid !== 0) {
