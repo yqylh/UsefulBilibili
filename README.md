@@ -1,7 +1,7 @@
 # usefulbilibili
 
 一个面向哔哩哔哩（Bilibili）的油猴脚本仓库。  
-当前包含 2 个脚本，后续会继续扩展更多场景。
+当前包含 3 个脚本，后续会继续扩展更多场景。
 
 ## 仓库目标
 
@@ -15,6 +15,7 @@
 |---|---|---|---|---|
 | BILI-001 | `[Bilibili] 动态页封面一键收藏` | `scripts/bilibili/bilibili-dynamic-quick-favorite.user.js` | `https://t.bilibili.com/*` | 在动态流视频封面上直接一键收藏，支持 Shift+点击切换目标收藏夹 |
 | BILI-002 | `[Bilibili] 收藏页卡片一键取消收藏` | `scripts/bilibili/bilibili-favlist-quick-unfavorite.user.js` | `https://space.bilibili.com/*/favlist*` | 在收藏夹视频卡片上增加快捷按钮，一键触发取消收藏流程 |
+| BILI-003 | `[Bilibili] 收藏页分区筛选恢复` | `scripts/bilibili/bilibili-favlist-partition-filter.user.js` | `https://space.bilibili.com/*/favlist*` | 恢复收藏夹页面“按分区筛选”能力，选择分区后按接口结果显示对应内容 |
 
 ## 使用前准备
 
@@ -83,6 +84,31 @@
 
 - 该脚本通过模拟页面按钮点击完成操作，不直接调用收藏接口。
 - 若页面菜单文案、层级或按钮类名变化，可能需要更新脚本中的候选选择器。
+
+### BILI-003 `[Bilibili] 收藏页分区筛选恢复`
+
+文件：`scripts/bilibili/bilibili-favlist-partition-filter.user.js`
+
+功能说明：
+
+- 在收藏夹页面顶部注入“分区筛选”下拉框。
+- 默认保持 B 站原生列表不变；只有选择具体分区后，脚本才接管列表区域。
+- 通过收藏夹接口的 `tid` 参数重新拉取结果，而不是仅对当前已渲染卡片做前端隐藏。
+- 支持上一页 / 下一页翻页，切回“全部分区”或点击“返回原列表”即可恢复 B 站原生视图。
+
+使用步骤：
+
+1. 打开任意收藏夹列表页：`https://space.bilibili.com/<uid>/favlist`。
+2. 在列表上方找到“分区筛选”下拉框。
+3. 选择例如“游戏 / 动画 / 知识”等分区。
+4. 页面会切换为脚本渲染的筛选结果视图。
+5. 如需退出筛选，选择“全部分区”或点击“返回原列表”。
+
+注意事项：
+
+- 当前脚本使用收藏夹接口按分区重新请求数据，排序固定为“按收藏时间”。
+- 只在你明确选择某个分区时接管列表，尽量减少对原生页面的影响。
+- 若 B 站后续再次调整收藏页整体结构，脚本可能需要同步更新挂载位置选择器。
 
 ## 命名与目录规范（面向后续扩展）
 
