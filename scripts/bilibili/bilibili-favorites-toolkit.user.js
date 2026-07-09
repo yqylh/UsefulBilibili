@@ -1,21 +1,33 @@
 // ==UserScript==
-// @name         [Bilibili] 收藏页分区筛选恢复
+// @name         [Bilibili] 收藏与收藏夹效率工具
 // @namespace    https://github.com/yinyongqi/usefulbilibili
-// @version      0.2.0
-// @description  在收藏夹页面恢复“按分区筛选”能力，并支持筛选结果内批量取消收藏
+// @version      1.0.0
+// @description  动态页封面一键收藏；收藏页快捷取消收藏、分区筛选与批量管理
+// @author       yqy
+// @match        https://t.bilibili.com/*
 // @match        https://space.bilibili.com/*/favlist*
 // @run-at       document-idle
-// @grant        none
+// @icon         https://www.bilibili.com/favicon.ico
+// @grant        GM_xmlhttpRequest
+// @grant        GM_addStyle
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @connect      api.bilibili.com
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  const SCRIPT_KEY = 'tm-fav-partition-filter';
+  const SCRIPT_KEY = 'tm-bili-favorites-toolkit';
   const PANEL_ID = `${SCRIPT_KEY}-panel`;
   const ROOT_ID = `${SCRIPT_KEY}-root`;
   const STYLE_ID = `${SCRIPT_KEY}-style`;
   const TOAST_ID = `${SCRIPT_KEY}-toast`;
+  const NATIVE_UNFAV_CLASS = `${SCRIPT_KEY}-unfav-btn`;
+  const DYNAMIC_BUTTON_CLASS = `${SCRIPT_KEY}-dynamic-fav`;
+  // 沿用旧版脚本的键，升级到统一脚本后保留用户已选择的收藏夹。
+  const TARGET_FOLDER_ID_KEY = 'tm_quick_fav_media_id';
+  const TARGET_FOLDER_TITLE_KEY = 'tm_quick_fav_media_title';
   const HOST_SELECTOR = '.favlist-main .fav-list-main';
   const MAIN_SELECTOR = '.favlist-main';
   const SIDEBAR_SELECTOR = '.favlist-aside .vui_sidebar';
@@ -44,8 +56,11 @@
   const state = {
     mid: '',
     fid: '',
+    ftype: '',
     mediaId: '',
     folderTitle: '',
+    canDelete: false,
+    folderKey: '',
     tid: 0,
     pn: 1,
     hasMore: false,
@@ -62,6 +77,9 @@
 
   let favListCache = null;
   let mountObserver = null;
+  let syncTimer = null;
+  let lastSeenUrl = location.href;
+  const aidCache = new Map();
 
   function injectStyle() {
     if (document.getElementById(STYLE_ID)) return;
@@ -196,6 +214,28 @@
         opacity:.42;
         cursor:not-allowed;
       }
+      .${NATIVE_UNFAV_CLASS}{
+        position:absolute;
+        top:8px;
+        right:8px;
+        z-index:8;
+        height:30px;
+        padding:0 10px;
+        border:1px solid rgba(255,255,255,.72);
+        border-radius:999px;
+        background:rgba(24,25,28,.72);
+        color:#fff;
+        font-size:12px;
+        cursor:pointer;
+        backdrop-filter:blur(6px);
+      }
+      .${NATIVE_UNFAV_CLASS}:hover{
+        background:rgba(24,25,28,.88);
+      }
+      .${NATIVE_UNFAV_CLASS}[disabled]{
+        opacity:.58;
+        cursor:wait;
+      }
       #${ROOT_ID} .tm-fav-filter-page-info{
         min-width:66px;
         color:#61666d;
@@ -278,6 +318,10 @@
         flex-direction:column;
         gap:10px;
         padding:14px;
+      }
+      #${ROOT_ID} .tm-fav-filter-card-actions{
+        display:flex;
+        justify-content:flex-end;
       }
       #${ROOT_ID} .tm-fav-filter-card-title{
         display:-webkit-box;
@@ -414,36 +458,59 @@
     return CHANNELS.find((item) => item.tid === Number(tid))?.name || '未知分区';
   }
 
-  function fetchJSON(url, init) {
-    return fetch(url, {
-      credentials: 'include',
-      ...init,
-    }).then(async (res) => {
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      if (json.code !== 0) throw new Error(json.message || `接口错误(${json.code})`);
-      return json.data;
+  function requestJSON(url, options = {}) {
+    const method = options.method || 'GET';
+    return new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        method,
+        url,
+        timeout: 15000,
+        data: options.data,
+        headers: options.headers,
+        onload: (response) => {
+          if (response.status < 200 || response.status >= 300) {
+            reject(new Error(`HTTP ${response.status}`));
+            return;
+          }
+
+          try {
+            const json = JSON.parse(response.responseText);
+            if (json.code !== 0) {
+              reject(new Error(json.message || `接口错误(${json.code})`));
+              return;
+            }
+            resolve(json.data);
+          } catch (err) {
+            reject(err);
+          }
+        },
+        onerror: () => reject(new Error('网络请求失败')),
+        ontimeout: () => reject(new Error('网络请求超时')),
+      });
     });
+  }
+
+  function fetchJSON(url) {
+    return requestJSON(url);
   }
 
   function postFormJSON(url, params) {
-    const body = new URLSearchParams(params).toString();
-    return fetchJSON(url, {
+    return requestJSON(url, {
       method: 'POST',
+      data: new URLSearchParams(params).toString(),
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
       },
-      body,
     });
   }
 
-  async function batchDeleteResources(resourceList) {
+  async function batchDeleteResources(resourceList, mediaId = state.mediaId) {
     const csrf = getCookie('bili_jct');
     if (!csrf) throw new Error('未获取到 bili_jct，请确认已登录 B 站');
-    if (!state.mediaId) throw new Error('未识别当前收藏夹 media_id');
+    if (!mediaId) throw new Error('未识别当前收藏夹 media_id');
 
     return postFormJSON('https://api.bilibili.com/x/v3/fav/resource/batch-del', {
-      media_id: String(state.mediaId),
+      media_id: String(mediaId),
       resources: resourceList,
       platform: 'web',
       csrf,
@@ -477,46 +544,157 @@
     return items.indexOf(active);
   }
 
+  function getActiveFolderTitle() {
+    const active = document.querySelector('.favlist-aside .vui_sidebar-item--active')
+      ?.closest('.fav-sidebar-item');
+    return active?.getAttribute('title') || active?.textContent?.trim() || '';
+  }
+
   async function resolveCurrentFolder() {
     const mid = getMidFromPath();
     if (!mid) return null;
 
     let fid = getQuery('fid');
+    const ftype = getQuery('ftype') || 'create';
     let mediaId = '';
-    let folderTitle = '';
+    let folderTitle = getActiveFolderTitle();
 
-    try {
-      const favs = await fetchCreatedFavList(mid);
-      if (favs.length) {
-        const activeIndex = getActiveSidebarIndex();
-        const activeFav = activeIndex >= 0 ? favs[activeIndex] : null;
-        if (activeFav) {
-          fid = String(activeFav.fid);
-          mediaId = String(activeFav.id);
-          folderTitle = activeFav.title || '';
+    if (ftype === 'create') {
+      try {
+        const favs = await fetchCreatedFavList(mid);
+        if (fid) {
+          const matched = favs.find((item) =>
+            String(item.fid) === String(fid) || String(item.id) === String(fid)
+          );
+          if (matched) {
+            fid = String(matched.fid);
+            mediaId = String(matched.id);
+            folderTitle = matched.title || folderTitle;
+          }
         }
+
+        if (!mediaId && !fid && favs.length) {
+          const activeIndex = getActiveSidebarIndex();
+          const activeFav = activeIndex >= 0 ? favs[activeIndex] : favs[0];
+          if (activeFav) {
+            fid = String(activeFav.fid);
+            mediaId = String(activeFav.id);
+            folderTitle = activeFav.title || folderTitle;
+          }
+        }
+      } catch (err) {
+        console.warn(`[${SCRIPT_KEY}] 获取收藏夹列表失败`, err);
       }
 
-      if (!mediaId && fid) {
-        const matched = favs.find((item) =>
-          String(item.fid) === String(fid) || String(item.id) === String(fid)
-        );
-        if (matched) {
-          fid = String(matched.fid);
-          mediaId = String(matched.id);
-          folderTitle = matched.title || '';
-        }
+      if (!mediaId) {
+        mediaId = buildMediaId(mid, fid);
       }
-    } catch (err) {
-      console.warn(`[${SCRIPT_KEY}] 获取收藏夹列表失败`, err);
-    }
-
-    if (!mediaId) {
-      mediaId = buildMediaId(mid, fid);
+    } else if (fid) {
+      // 订阅收藏夹等非自建列表的 fid 已经是接口需要的 media_id。
+      mediaId = String(fid);
     }
 
     if (!mediaId) return null;
-    return { mid, fid, mediaId, folderTitle };
+
+    const canDelete = ftype === 'create' && String(getCookie('DedeUserID')) === String(mid);
+    return {
+      mid,
+      fid,
+      ftype,
+      mediaId,
+      folderTitle,
+      canDelete,
+      folderKey: `${mid}:${ftype}:${mediaId}`,
+    };
+  }
+
+  function extractBvidFromHref(href) {
+    const match = String(href || '').match(/\/video\/(BV[0-9A-Za-z]+)\b/);
+    return match ? match[1] : '';
+  }
+
+  async function fetchAidByBvid(bvid) {
+    if (!aidCache.has(bvid)) {
+      const promise = fetchJSON(
+        `https://api.bilibili.com/x/web-interface/view?bvid=${encodeURIComponent(bvid)}`
+      ).then((data) => {
+        if (!data?.aid) throw new Error('未获取到视频 aid');
+        return data.aid;
+      }).catch((err) => {
+        aidCache.delete(bvid);
+        throw err;
+      });
+      aidCache.set(bvid, promise);
+    }
+    return aidCache.get(bvid);
+  }
+
+  async function handleNativeUnfavorite(button, card, bvid) {
+    if (button.disabled) return;
+    button.disabled = true;
+    button.textContent = '处理中...';
+
+    let folder;
+    try {
+      folder = await resolveCurrentFolder();
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = '取消收藏';
+      toast(`无法识别收藏夹：${err instanceof Error ? err.message : String(err)}`);
+      return;
+    }
+    if (!folder?.canDelete) {
+      button.disabled = false;
+      button.textContent = '取消收藏';
+      toast('这里只能管理当前账号创建的收藏夹');
+      return;
+    }
+
+    button.textContent = '取消中...';
+
+    try {
+      const aid = await fetchAidByBvid(bvid);
+      await batchDeleteResources(`${aid}:2`, folder.mediaId);
+      toast('已取消收藏');
+      card.remove();
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = '取消收藏';
+      toast(`取消收藏失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  function injectNativeUnfavoriteButtons() {
+    const existingButtons = document.querySelectorAll(`.${NATIVE_UNFAV_CLASS}`);
+    if (!state.canDelete) {
+      existingButtons.forEach((button) => button.remove());
+      return;
+    }
+
+    const cards = document.querySelectorAll(`${HOST_SELECTOR} .bili-video-card`);
+    cards.forEach((card) => {
+      if (card.closest(`#${ROOT_ID}`) || card.querySelector(`.${NATIVE_UNFAV_CLASS}`)) return;
+
+      const link = card.querySelector('a[href*="/video/BV"]');
+      const bvid = extractBvidFromHref(link?.getAttribute('href'));
+      if (!bvid) return;
+
+      if (getComputedStyle(card).position === 'static') {
+        card.style.position = 'relative';
+      }
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = NATIVE_UNFAV_CLASS;
+      button.textContent = '取消收藏';
+      button.title = '从当前收藏夹移除这个视频';
+      button.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        handleNativeUnfavorite(button, card, bvid);
+      }, true);
+      card.appendChild(button);
+    });
   }
 
   function ensureMounted() {
@@ -566,6 +744,9 @@
         syncMode();
       });
     }
+    if (panel.parentNode !== host.parentNode || panel.nextElementSibling !== host) {
+      host.parentNode?.insertBefore(panel, host);
+    }
     state.panel = panel;
 
     let root = document.getElementById(ROOT_ID);
@@ -573,6 +754,9 @@
       root = document.createElement('section');
       root.id = ROOT_ID;
       root.hidden = true;
+      host.insertAdjacentElement('afterend', root);
+    }
+    if (root.parentNode !== host.parentNode || root.previousElementSibling !== host) {
       host.insertAdjacentElement('afterend', root);
     }
     state.root = root;
@@ -618,6 +802,7 @@
   }
 
   function buildResourceKey(media) {
+    if (media?.id == null || media?.type == null) return '';
     return `${media.id}:${media.type}`;
   }
 
@@ -647,7 +832,10 @@
 
   function selectAllCurrentPage() {
     const medias = Array.isArray(state.lastData?.medias) ? state.lastData.medias : [];
-    medias.forEach((media) => state.selectedResources.add(buildResourceKey(media)));
+    medias.forEach((media) => {
+      const resourceKey = buildResourceKey(media);
+      if (resourceKey) state.selectedResources.add(resourceKey);
+    });
     rerenderCurrentView();
   }
 
@@ -658,24 +846,50 @@
 
   async function handleBatchDelete() {
     const resources = Array.from(state.selectedResources);
-    if (state.deleting || resources.length === 0) return;
+    if (state.deleting || resources.length === 0 || !state.canDelete) return;
 
     const ok = confirm(`确认取消收藏已选中的 ${resources.length} 个视频吗？`);
     if (!ok) return;
 
+    const mediaId = state.mediaId;
+    const folderKey = state.folderKey;
     state.deleting = true;
     rerenderCurrentView();
 
     try {
-      await batchDeleteResources(resources.join(','));
+      await batchDeleteResources(resources.join(','), mediaId);
       resources.forEach((item) => state.selectedResources.delete(item));
       toast(`已取消收藏 ${resources.length} 个视频`);
       state.deleting = false;
-      await renderFilteredList();
+      if (folderKey === state.folderKey) {
+        await renderFilteredList();
+      }
     } catch (err) {
       state.deleting = false;
       rerenderCurrentView();
       toast(`批量取消收藏失败：${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  async function handleSingleFilteredDelete(resourceKey, button) {
+    if (!state.canDelete || state.deleting || !resourceKey) return;
+
+    const mediaId = state.mediaId;
+    const folderKey = state.folderKey;
+    button.disabled = true;
+    button.textContent = '取消中...';
+
+    try {
+      await batchDeleteResources(resourceKey, mediaId);
+      state.selectedResources.delete(resourceKey);
+      toast('已取消收藏');
+      if (folderKey === state.folderKey) {
+        await renderFilteredList();
+      }
+    } catch (err) {
+      button.disabled = false;
+      button.textContent = '取消收藏';
+      toast(`取消收藏失败：${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -685,7 +899,7 @@
 
     const resourceKey = buildResourceKey(media);
     const isSelected = state.selectedResources.has(resourceKey);
-    if (state.batchMode) {
+    if (state.batchMode && state.canDelete) {
       li.classList.add('tm-fav-filter-card--batch');
     }
     if (isSelected) {
@@ -745,7 +959,23 @@
     body.appendChild(upLine);
     body.appendChild(statLine);
 
-    if (state.batchMode) {
+    if (state.canDelete && !state.batchMode && resourceKey) {
+      const cardActions = document.createElement('div');
+      cardActions.className = 'tm-fav-filter-card-actions';
+      const deleteButton = document.createElement('button');
+      deleteButton.type = 'button';
+      deleteButton.className = 'tm-fav-filter-page-btn tm-fav-filter-danger-btn';
+      deleteButton.textContent = '取消收藏';
+      deleteButton.addEventListener('click', (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        handleSingleFilteredDelete(resourceKey, deleteButton);
+      });
+      cardActions.appendChild(deleteButton);
+      body.appendChild(cardActions);
+    }
+
+    if (state.batchMode && state.canDelete) {
       const check = document.createElement('button');
       check.type = 'button';
       check.className = `tm-fav-filter-check${isSelected ? ' tm-fav-filter-check--selected' : ''}`;
@@ -790,7 +1020,7 @@
     const actions = document.createElement('div');
     actions.className = 'tm-fav-filter-actions';
 
-    if (state.batchMode) {
+    if (state.batchMode && state.canDelete) {
       const selectAll = document.createElement('button');
       selectAll.type = 'button';
       selectAll.className = 'tm-fav-filter-page-btn';
@@ -828,7 +1058,7 @@
       actions.appendChild(clearBtn);
       actions.appendChild(deleteBtn);
       actions.appendChild(doneBtn);
-    } else {
+    } else if (state.canDelete) {
       const batchBtn = document.createElement('button');
       batchBtn.type = 'button';
       batchBtn.className = 'tm-fav-filter-page-btn tm-fav-filter-accent-btn';
@@ -958,13 +1188,21 @@
 
     const token = ++state.syncToken;
     const folder = await resolveCurrentFolder();
-    if (token !== state.syncToken || !folder) return;
+    if (token !== state.syncToken) return;
+    if (!folder) {
+      state.canDelete = false;
+      injectNativeUnfavoriteButtons();
+      return;
+    }
 
-    const folderChanged = folder.mediaId !== state.mediaId;
+    const folderChanged = folder.folderKey !== state.folderKey;
     state.mid = folder.mid;
     state.fid = folder.fid;
+    state.ftype = folder.ftype;
     state.mediaId = folder.mediaId;
     state.folderTitle = folder.folderTitle || '';
+    state.canDelete = folder.canDelete;
+    state.folderKey = folder.folderKey;
 
     if (folderChanged) {
       state.pn = 1;
@@ -981,40 +1219,286 @@
     } else {
       syncMode();
     }
+
+    const hint = state.panel?.querySelector('.tm-fav-filter-hint');
+    if (hint) {
+      const hintText = state.canDelete
+        ? '选择具体分区后显示接口筛选结果，并可直接或批量取消收藏。'
+        : '当前列表支持分区筛选；删除功能只对本账号创建的收藏夹开放。';
+      if (hint.textContent !== hintText) hint.textContent = hintText;
+    }
+    injectNativeUnfavoriteButtons();
+  }
+
+  function injectDynamicStyle() {
+    GM_addStyle(`
+      .${DYNAMIC_BUTTON_CLASS}-wrap{
+        position:absolute;
+        inset:0;
+        z-index:9;
+        pointer-events:none;
+      }
+      .${DYNAMIC_BUTTON_CLASS}{
+        position:absolute;
+        top:8px;
+        right:8px;
+        z-index:10;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        width:32px;
+        height:32px;
+        padding:0;
+        border:1px solid rgba(255,255,255,.55);
+        border-radius:999px;
+        background:rgba(0,0,0,.58);
+        color:#fff;
+        font-size:17px;
+        cursor:pointer;
+        pointer-events:auto;
+        backdrop-filter:saturate(120%) blur(4px);
+        transition:transform .12s ease, background .12s ease, opacity .12s ease;
+      }
+      .${DYNAMIC_BUTTON_CLASS}:hover{
+        transform:scale(1.06);
+        background:rgba(0,0,0,.74);
+      }
+      .${DYNAMIC_BUTTON_CLASS}[disabled]{
+        cursor:wait;
+        opacity:.66;
+      }
+      .${DYNAMIC_BUTTON_CLASS}-tip{
+        position:absolute;
+        top:44px;
+        right:8px;
+        z-index:10;
+        padding:6px 8px;
+        border-radius:8px;
+        background:rgba(0,0,0,.74);
+        color:#fff;
+        font-size:12px;
+        white-space:nowrap;
+        opacity:0;
+        transform:translateY(-4px);
+        transition:opacity .12s ease, transform .12s ease;
+      }
+      .${DYNAMIC_BUTTON_CLASS}-wrap:hover .${DYNAMIC_BUTTON_CLASS}-tip{
+        opacity:1;
+        transform:translateY(0);
+      }
+      #${TOAST_ID}{
+        position:fixed;
+        top:18px;
+        left:50%;
+        z-index:999999;
+        transform:translateX(-50%);
+        max-width:min(72vw, 520px);
+        padding:10px 14px;
+        border-radius:12px;
+        background:rgba(24,25,28,.88);
+        color:#fff;
+        font-size:13px;
+        line-height:1.45;
+        box-shadow:0 14px 34px rgba(0,0,0,.18);
+        opacity:0;
+        pointer-events:none;
+        transition:opacity .18s ease;
+      }
+    `);
+  }
+
+  async function ensureDynamicTargetFolder() {
+    const csrf = getCookie('bili_jct');
+    const mid = getCookie('DedeUserID');
+    if (!csrf || !mid) {
+      throw new Error('未登录或缺少登录 Cookie');
+    }
+
+    let mediaId = String(GM_getValue(TARGET_FOLDER_ID_KEY, '') || '');
+    let title = String(GM_getValue(TARGET_FOLDER_TITLE_KEY, '') || '');
+    if (!mediaId) {
+      const folders = await fetchCreatedFavList(mid);
+      const firstFolder = folders[0];
+      if (!firstFolder) throw new Error('未找到可用的收藏夹');
+      mediaId = String(firstFolder.id);
+      title = String(firstFolder.title || '默认收藏夹');
+      GM_setValue(TARGET_FOLDER_ID_KEY, mediaId);
+      GM_setValue(TARGET_FOLDER_TITLE_KEY, title);
+      toast(`快速收藏目标：${title}`);
+    }
+
+    return { csrf, mid, mediaId, title };
+  }
+
+  async function pickDynamicTargetFolder() {
+    const mid = getCookie('DedeUserID');
+    if (!mid) throw new Error('请先登录 B 站');
+
+    const folders = await fetchCreatedFavList(mid);
+    if (!folders.length) throw new Error('没有可选的收藏夹');
+
+    const lines = folders.map((folder, index) => `${index + 1}. ${folder.title}`).join('\n');
+    const answer = prompt(
+      `选择快速收藏目标：\n${lines}\n\n输入序号（1-${folders.length}）：`,
+      '1'
+    );
+    if (answer == null || answer.trim() === '') return null;
+
+    const index = Number(answer) - 1;
+    if (!Number.isInteger(index) || index < 0 || index >= folders.length) {
+      throw new Error('输入的序号无效');
+    }
+
+    const folder = folders[index];
+    GM_setValue(TARGET_FOLDER_ID_KEY, String(folder.id));
+    GM_setValue(TARGET_FOLDER_TITLE_KEY, String(folder.title || '收藏夹'));
+    toast(`已切换目标：${folder.title}`);
+    return folder;
+  }
+
+  async function addVideoToFolder(aid, mediaId, csrf) {
+    return postFormJSON('https://api.bilibili.com/x/v3/fav/resource/deal', {
+      rid: String(aid),
+      type: '2',
+      add_media_ids: String(mediaId),
+      csrf,
+    });
+  }
+
+  function findDynamicCoverHost(anchor) {
+    const image = anchor.querySelector('img');
+    if (!image) return null;
+
+    const picture = image.closest('picture');
+    let host = picture?.parentElement || image.parentElement || anchor;
+    for (let i = 0; i < 2 && host; i += 1) {
+      const rect = host.getBoundingClientRect();
+      if (rect.width >= 120 && rect.height >= 60) break;
+      host = host.parentElement;
+    }
+    return host || anchor;
+  }
+
+  async function handleDynamicFavorite(button, tip, bvid) {
+    if (button.disabled) return;
+    button.disabled = true;
+    tip.textContent = '收藏中...';
+
+    try {
+      const [folder, aid] = await Promise.all([
+        ensureDynamicTargetFolder(),
+        fetchAidByBvid(bvid),
+      ]);
+      await addVideoToFolder(aid, folder.mediaId, folder.csrf);
+      tip.textContent = `已收藏到：${folder.title}`;
+      toast(`已收藏到：${folder.title}`);
+    } catch (err) {
+      tip.textContent = '收藏失败';
+      toast(`收藏失败：${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      button.disabled = false;
+      setTimeout(() => {
+        tip.textContent = '一键收藏';
+      }, 1400);
+    }
+  }
+
+  function injectDynamicFavorite(anchor) {
+    if (!(anchor instanceof HTMLAnchorElement)) return;
+    const bvid = extractBvidFromHref(anchor.getAttribute('href'));
+    if (!bvid || !anchor.querySelector('img')) return;
+
+    const host = findDynamicCoverHost(anchor);
+    if (!host || host.querySelector(`:scope > .${DYNAMIC_BUTTON_CLASS}-wrap`)) return;
+    if (getComputedStyle(host).position === 'static') {
+      host.style.position = 'relative';
+    }
+
+    const wrap = document.createElement('div');
+    wrap.className = `${DYNAMIC_BUTTON_CLASS}-wrap`;
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = DYNAMIC_BUTTON_CLASS;
+    button.textContent = '★';
+    button.title = '一键收藏；Shift + 点击切换收藏夹';
+
+    const tip = document.createElement('span');
+    tip.className = `${DYNAMIC_BUTTON_CLASS}-tip`;
+    tip.textContent = '一键收藏';
+
+    button.addEventListener('click', async (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (event.shiftKey) {
+        try {
+          await pickDynamicTargetFolder();
+        } catch (err) {
+          toast(`切换失败：${err instanceof Error ? err.message : String(err)}`);
+        }
+        return;
+      }
+      await handleDynamicFavorite(button, tip, bvid);
+    }, true);
+
+    wrap.appendChild(button);
+    wrap.appendChild(tip);
+    host.appendChild(wrap);
+  }
+
+  function scanDynamicFavorites(root = document) {
+    if (root instanceof HTMLAnchorElement && root.matches('a[href*="/video/BV"]')) {
+      injectDynamicFavorite(root);
+    }
+    root.querySelectorAll?.('a[href*="/video/BV"]').forEach(injectDynamicFavorite);
+  }
+
+  function bootDynamic() {
+    injectDynamicStyle();
+    scanDynamicFavorites();
+
+    const observer = new MutationObserver((mutations) => {
+      mutations.forEach((mutation) => {
+        mutation.addedNodes.forEach((node) => {
+          if (node instanceof HTMLElement) scanDynamicFavorites(node);
+        });
+      });
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+  }
+
+  function scheduleFavlistSync(delay = 80) {
+    clearTimeout(syncTimer);
+    syncTimer = setTimeout(() => {
+      syncFromPage();
+    }, delay);
   }
 
   function installUrlWatcher() {
-    const eventName = `${SCRIPT_KEY}:urlchange`;
-    const wrap = (method) => {
-      const original = history[method];
-      history[method] = function patchedHistoryState() {
-        const result = original.apply(this, arguments);
-        window.dispatchEvent(new Event(eventName));
-        return result;
-      };
-    };
-
-    wrap('pushState');
-    wrap('replaceState');
-    window.addEventListener('popstate', () => window.dispatchEvent(new Event(eventName)));
-    window.addEventListener(eventName, () => {
-      setTimeout(() => {
-        syncFromPage();
-      }, 60);
-    });
+    window.addEventListener('popstate', () => scheduleFavlistSync(0));
+    setInterval(() => {
+      if (location.href === lastSeenUrl) return;
+      lastSeenUrl = location.href;
+      state.canDelete = false;
+      injectNativeUnfavoriteButtons();
+      scheduleFavlistSync(0);
+    }, 400);
   }
 
-  function boot() {
+  function bootFavlist() {
     installUrlWatcher();
 
     mountObserver = new MutationObserver(() => {
-      if (!ensureMounted()) return;
-      syncFromPage();
+      scheduleFavlistSync();
     });
 
     mountObserver.observe(document.body, { childList: true, subtree: true });
-    syncFromPage();
+    scheduleFavlistSync(0);
   }
 
-  boot();
+  if (location.hostname === 't.bilibili.com') {
+    bootDynamic();
+  } else if (location.hostname === 'space.bilibili.com') {
+    bootFavlist();
+  }
 })();
